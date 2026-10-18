@@ -1,0 +1,79 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # no binary cache has the toolchain, so every run builds binutils, gcc and
+    # newlib from source, then the Windows host programs: hours on 4 cores.
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # the build peaks around 7G in /tmp plus ~5G of store, more than the
+      # runner image leaves free; most of it is SDKs this job doesn't use.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Build
+        run: nix build -L .#tricore-gcc-toolchain .#tricore-gcc-toolchain-windows-zip
+
+      - name: Smoke test
+        run: |
+          cat > hello.c <<'EOF'
+          #include <stdio.h>
+          int main(void) { printf("%lld\n", 1LL << 40); return 0; }
+          EOF
+          cat > hello.cc <<'EOF'
+          #include <string>
+          #include <vector>
+          int main() { std::vector<std::string> v{"a"}; return v[0] == "a" ? 0 : 1; }
+          EOF
+          ./result/bin/tricore-elf-gcc -O2 hello.c -o hello.elf
+          ./result/bin/tricore-elf-g++ -O2 hello.cc -o hellocc.elf
+          ./result/bin/tricore-elf-size hello.elf hellocc.elf
+
+      # result-1 is the zip; copied out under its store name minus the hash
+      - name: Collect Windows zip
+        run: |
+          mkdir dist
+          zip=$(readlink result-1)
+          cp "$zip" "dist/$(basename "$zip" | cut -d- -f2-)"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/*.zip
+          archive: false
+          if-no-files-found: error
+
+      - name: Build container image
+        run: nix build -L .#container -o result-container
+
+      - name: Push container image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GHCR_CREDS: ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}
+        run: |
+          image=$(nix eval --raw .#container.imageName)
+          tag=$(nix eval --raw .#container.imageTag)
+          skopeo() { nix shell --inputs-from . nixpkgs#skopeo -c skopeo --insecure-policy "$@"; }
+          skopeo copy --dest-creds "$GHCR_CREDS" docker-archive:result-container "docker://$image:$tag"
+          skopeo copy --src-creds "$GHCR_CREDS" --dest-creds "$GHCR_CREDS" "docker://$image:$tag" "docker://$image:latest"
